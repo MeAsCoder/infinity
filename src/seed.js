@@ -8,6 +8,11 @@
  * not reliably attributable to specific product rows, so they were not
  * used. Update real prices from Admin -> Products before going live.
  *
+ * NOTE: this only runs on a fresh database (no .seeded marker on disk,
+ * per the Dockerfile's boot sequence). It does NOT rename or update users
+ * that already exist — for renaming an already-seeded live user, use
+ * src/scripts/renameUser.js instead.
+ *
  * Run: npm run seed   (safe to re-run; it skips rows that already exist)
  */
 const db = require('./db');
@@ -218,10 +223,10 @@ function main() {
   const waiterRole = ensureRole('WAITER', PERMISSIONS.WAITER);
 
   // Create users with real names as usernames
-  const superAdmin = ensureUser('Janeth Wambui', 'janethwambui', '0700000000', 'ChangeMe123!', superAdminRole.id, 100);
+  const superAdmin = ensureUser('Moh', 'Moh', '0700000000', 'Moh001', superAdminRole.id, 100);
   const admin = ensureUser('Agnes Mweni', 'agnesmweni', '0733333333', 'Manager123!', adminRole.id, 15);
-  const waiter1 = ensureUser('Malik Mik', 'malikmik', '0711111111', 'Waiter123!', waiterRole.id, 0);
-  const waiter2 = ensureUser('Catherin Kim', 'catherinkim', '0722222222', 'Waiter123!', waiterRole.id, 0);
+  const waiter1 = ensureUser('Dama', 'Dama', '0711111111', 'Dama123', waiterRole.id, 0);
+  const waiter2 = ensureUser('Joy', 'Joy', '0722222222', 'Joy254', waiterRole.id, 0);
 
   ensureSetting('currency', 'KES');
   ensureSetting('currency_decimals', '0');
@@ -236,10 +241,10 @@ function main() {
 
   console.log(`Seed complete.`);
   console.log(`  Roles:   SUPER_ADMIN, ADMIN, WAITER`);
-  console.log(`  Users:   janethwambui / ChangeMe123!  (Super Admin)`);
-  console.log(`           agnesmweni / Manager123!     (Admin)`);
-  console.log(`           malikmik / Waiter123!         (Waiter)`);
-  console.log(`           catherinkim / Waiter123!      (Waiter)`);
+  console.log(`  Users:   Moh / Moh001            (Super Admin)`);
+  console.log(`           agnesmweni / Manager123! (Admin)`);
+  console.log(`           Dama / Dama123           (Waiter)`);
+  console.log(`           Joy / Joy254              (Waiter)`);
   console.log(`  Products created: ${created}`);
   console.log(`  NOTE: opening stock is 0 for all products and prices are placeholders.`);
   console.log(`  Log in as admin -> Stock Receiving (or Stocktake) to set real starting stock,`);

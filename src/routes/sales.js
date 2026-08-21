@@ -473,6 +473,42 @@ router.get('/debts', requirePermission('sales.view_all'), (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
+// POST /api/sales/debts/:id/resolve - Admin marks a specific credit-ledger SALE
+// entry as paid or written off. Resolves only THIS entry's own amount, not the
+// customer's total outstanding balance, so resolving one debt among several
+// doesn't over-correct the others.
+router.post('/debts/:id/resolve', requirePermission('credit.manage'), (req, res) => {
+  const ledgerEntry = db.prepare("SELECT * FROM credit_ledger WHERE id = ? AND type = 'SALE'").get(req.params.id);
+  if (!ledgerEntry) return res.status(404).json({ error: 'Debt entry not found' });
+
+  const { action, notes } = req.body;
+  if (!['PAID', 'WRITE_OFF'].includes(action)) return res.status(400).json({ error: "action must be 'PAID' or 'WRITE_OFF'" });
+
+  const result = {};
+  const tx = db.transaction(() => {
+    appendCreditLedger({
+      customerId: ledgerEntry.customer_id,
+      type: action === 'PAID' ? 'PAYMENT' : 'WRITE_OFF',
+      amount: -ledgerEntry.amount,
+      refType: 'SALE',
+      refId: ledgerEntry.ref_id,
+      userId: req.user.id,
+      approvedBy: req.user.id,
+      notes: notes || (action === 'PAID' ? `Marked paid by admin (offsets ledger #${ledgerEntry.id})` : `Written off by admin (offsets ledger #${ledgerEntry.id})`),
+    });
+
+    writeAudit({
+      event: action === 'PAID' ? 'DEBT_MARKED_PAID' : 'DEBT_WRITTEN_OFF',
+      userId: req.user.id, role: req.user.role, entityType: 'CREDIT_LEDGER', entityId: ledgerEntry.id,
+      newValue: { customerId: ledgerEntry.customer_id, amount: ledgerEntry.amount, notes: notes || null },
+    });
+    result.customerId = ledgerEntry.customer_id;
+  });
+
+  try { tx(); } catch (e) { return res.status(422).json({ error: e.message }); }
+  res.json({ ok: true, customerId: result.customerId, resolvedAmount: ledgerEntry.amount });
+});
+
 // GET /api/sales/:id
 router.get('/:id', requirePermission('sales.view_all'), (req, res) => {
   const sale = serializeSale(req.params.id);
