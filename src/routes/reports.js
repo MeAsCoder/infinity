@@ -346,21 +346,40 @@ router.get('/waiters-performance', (req, res) => {
         // "debt_logs" table in this schema; querying credit_ledger here keeps
         // this route consistent with what /api/sales/waiter/:id/debts already
         // returns on the waiter's own dashboard.
+        //
+        // IMPORTANT: this nets PAYMENT/WRITE_OFF entries (written by
+        // /api/sales/debts/:id/resolve) against the original SALE entry, per
+        // sale, and only counts/sums sales that still have a positive balance.
+        // A naive SUM(amount) WHERE type='SALE' (the old version of this
+        // query) reports lifetime gross debt ever incurred and never reflects
+        // a debt being marked paid or written off — this fixes that.
         const debtAgg = db.prepare(`
-          SELECT COUNT(DISTINCT s.id) as debt_count, COALESCE(SUM(cl.amount), 0) as total_debt
-          FROM credit_ledger cl
-          JOIN sales s ON s.id = cl.ref_id AND cl.ref_type = 'SALE'
-          WHERE cl.type = 'SALE' AND s.user_id = ?
+          WITH sale_balances AS (
+            SELECT cl.ref_id AS sale_id, COALESCE(SUM(cl.amount), 0) AS balance
+            FROM credit_ledger cl
+            JOIN sales s ON s.id = cl.ref_id AND cl.ref_type = 'SALE'
+            WHERE s.user_id = ?
+            GROUP BY cl.ref_id
+          )
+          SELECT
+            COALESCE(SUM(CASE WHEN balance > 0 THEN balance ELSE 0 END), 0) AS total_debt,
+            COUNT(CASE WHEN balance > 0 THEN 1 END) AS debt_count
+          FROM sale_balances
         `).get(waiter.id);
 
+        // Same netting logic as debtAgg above, applied per-sale so only
+        // still-owing debts show up in the detail list (not resolved ones).
         const allDebts = db.prepare(`
-          SELECT cl.id, cl.amount, cl.notes, cl.created_at, c.name AS customer_name,
-                 s.id AS sale_id, s.receipt_number, s.tab_label
+          SELECT s.id AS sale_id, s.receipt_number, s.tab_label, c.name AS customer_name,
+                 MAX(cl.created_at) AS created_at,
+                 COALESCE(SUM(cl.amount), 0) AS amount
           FROM credit_ledger cl
           JOIN sales s ON s.id = cl.ref_id AND cl.ref_type = 'SALE'
           JOIN customers c ON c.id = cl.customer_id
-          WHERE cl.type = 'SALE' AND s.user_id = ?
-          ORDER BY cl.id DESC LIMIT 50
+          WHERE s.user_id = ?
+          GROUP BY s.id, c.name, s.receipt_number, s.tab_label
+          HAVING amount > 0
+          ORDER BY s.id DESC LIMIT 50
         `).all(waiter.id);
 
         const shortages = db.prepare(`
@@ -557,7 +576,7 @@ router.get('/export', (req, res) => {
       summary: { totalRevenue, totalDiscounts, totalTransactions, averageTransaction: totalTransactions > 0 ? totalRevenue / totalTransactions : 0, totalDebts, debtCount: debts.length },
       sales, saleItems, payments, reconciliations, expenses, debts
     });
-  } catch (error) {
+  } catch (error) {~~
     console.error('Error in export:', error);
     res.status(500).json({ error: 'Failed to export report' });
   }
