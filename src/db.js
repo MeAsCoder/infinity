@@ -499,15 +499,34 @@ CREATE INDEX IF NOT EXISTS idx_stocktake_item_units_item ON stocktake_item_units
 `);
 
 // ---------------------------------------------------------------------------
-// MIGRATIONS
+// MIGRATIONS - SAFELY HANDLE EXISTING TABLES AND COLUMNS
 // ---------------------------------------------------------------------------
+
+// Safe alter function that handles both duplicate column and missing table errors
 function safeAlter(sql) {
-  try { db.exec(sql); } catch (e) { 
-    if (!/duplicate column name/i.test(e.message)) throw e; 
+  try { 
+    db.exec(sql); 
+  } catch (e) { 
+    // Check if the error is about duplicate column or missing table
+    if (!/duplicate column name/i.test(e.message) && !/no such table/i.test(e.message)) {
+      throw e; 
+    }
+    // Silently skip duplicate column or missing table errors
   }
 }
 
-// Existing migrations
+// Safe create function for tables
+function safeCreate(sql) {
+  try { 
+    db.exec(sql); 
+  } catch (e) { 
+    if (!/already exists/i.test(e.message)) {
+      throw e; 
+    }
+  }
+}
+
+// Existing migrations with safe handling
 safeAlter(`ALTER TABLE sales ADD COLUMN tab_label TEXT`);
 safeAlter(`ALTER TABLE sales ADD COLUMN amount_paid INTEGER NOT NULL DEFAULT 0`);
 safeAlter(`ALTER TABLE sales ADD COLUMN settled_at TEXT`);
@@ -520,10 +539,23 @@ safeAlter(`ALTER TABLE sales ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'SYNCE
 safeAlter(`ALTER TABLE debt_logs ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))`);
 safeAlter(`ALTER TABLE sales ADD COLUMN tip INTEGER NOT NULL DEFAULT 0`);
 safeAlter(`ALTER TABLE stocktake_items ADD COLUMN selling_unit_id INTEGER REFERENCES selling_units(id)`);
-safeAlter(`ALTER TABLE stocktakes ADD COLUMN shift_id INTEGER REFERENCES shifts(id)`);
+
+// FIXED: Only add shift_id if the stocktakes table exists
+try {
+  // Check if stocktakes table exists
+  const tableCheck = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='stocktakes'"
+  ).get();
+  
+  if (tableCheck) {
+    safeAlter(`ALTER TABLE stocktakes ADD COLUMN shift_id INTEGER REFERENCES shifts(id)`);
+  }
+} catch (e) {
+  console.log('Note: Could not add shift_id to stocktakes - table may not exist yet');
+}
 
 // Create new tables for enhanced features (if they don't exist)
-db.exec(`
+safeCreate(`
   CREATE TABLE IF NOT EXISTS shift_recounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     shift_id INTEGER NOT NULL REFERENCES shifts(id),
@@ -534,7 +566,7 @@ db.exec(`
   )
 `);
 
-db.exec(`
+safeCreate(`
   CREATE TABLE IF NOT EXISTS waiver_patterns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     waiter_id INTEGER NOT NULL REFERENCES users(id),
@@ -546,10 +578,15 @@ db.exec(`
   )
 `);
 
-db.exec(`
-  CREATE INDEX IF NOT EXISTS idx_shift_recounts_shift ON shift_recounts(shift_id);
-  CREATE INDEX IF NOT EXISTS idx_waiver_patterns_waiter ON waiver_patterns(waiter_id);
-  CREATE INDEX IF NOT EXISTS idx_waiver_patterns_resolved ON waiver_patterns(resolved_at);
-`);
+// Safely create indexes
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_shift_recounts_shift ON shift_recounts(shift_id);
+    CREATE INDEX IF NOT EXISTS idx_waiver_patterns_waiter ON waiver_patterns(waiter_id);
+    CREATE INDEX IF NOT EXISTS idx_waiver_patterns_resolved ON waiver_patterns(resolved_at);
+  `);
+} catch (e) {
+  console.log('Note: Some indexes already exist');
+}
 
 module.exports = db;
