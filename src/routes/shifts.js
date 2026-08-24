@@ -3,7 +3,7 @@ const router = express.Router();
 const db = require('../db');
 const { authMiddleware } = require('../auth');
 const { requirePermission } = require('../middleware/rbac');
-const { writeAudit } = require('../ledger');
+const { writeAudit, getProductStock, decomposeMlIntoUnits } = require('../ledger');
 
 router.use(authMiddleware);
 
@@ -57,18 +57,16 @@ router.get('/mine/reconciliations', (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-// GET /api/shifts/patterns/flagged - admin dashboard: waiters with recent flagged
-// cash-variance patterns (surplus and shortage patterns carry equal weight; see
-// checkWaiterPatterns below). Must be declared before the generic /:id route or
-// Express will try to treat "patterns" as a shift id.
+// GET /api/shifts/patterns/flagged
 router.get('/patterns/flagged', requirePermission('shifts.view_all'), (req, res) => {
   try {
     const { limit } = req.query;
     const rows = db.prepare(`
-      SELECT wp.id, wp.waiter_id, u.name AS waiter_name, wp.pattern_type, wp.score, wp.details
+      SELECT wp.waiter_id, u.name AS waiter_name, wp.pattern_type, wp.score, wp.details, wp.detected_at
       FROM waiver_patterns wp
       JOIN users u ON u.id = wp.waiter_id
-      ORDER BY wp.id DESC
+      WHERE wp.resolved_at IS NULL
+      ORDER BY wp.detected_at DESC
       LIMIT ?
     `).all(+(limit || 100));
 
@@ -78,7 +76,7 @@ router.get('/patterns/flagged', requirePermission('shifts.view_all'), (req, res)
         byWaiter[r.waiter_id] = { waiterId: r.waiter_id, waiterName: r.waiter_name, totalScore: 0, patterns: [] };
       }
       byWaiter[r.waiter_id].totalScore += r.score;
-      byWaiter[r.waiter_id].patterns.push({ type: r.pattern_type, score: r.score, detail: r.details });
+      byWaiter[r.waiter_id].patterns.push({ type: r.pattern_type, score: r.score, detail: r.details, at: r.detected_at });
     });
 
     res.json(Object.values(byWaiter).sort((a, b) => b.totalScore - a.totalScore));
@@ -98,11 +96,15 @@ router.get('/:id', (req, res) => {
 
 router.get('/', requirePermission('shifts.view_all'), (req, res) => {
   const { status, userId, limit } = req.query;
-  let sql = 'SELECT * FROM shifts WHERE 1=1';
+  let sql = `
+    SELECT sh.*, u.name AS waiter_name
+    FROM shifts sh
+    JOIN users u ON u.id = sh.user_id
+    WHERE 1=1`;
   const params = [];
-  if (status) { sql += ' AND status = ?'; params.push(status); }
-  if (userId) { sql += ' AND user_id = ?'; params.push(userId); }
-  sql += ' ORDER BY id DESC LIMIT ?'; params.push(+(limit || 100));
+  if (status) { sql += ' AND sh.status = ?'; params.push(status); }
+  if (userId) { sql += ' AND sh.user_id = ?'; params.push(userId); }
+  sql += ' ORDER BY sh.id DESC LIMIT ?'; params.push(+(limit || 100));
   res.json(db.prepare(sql).all(...params));
 });
 
@@ -129,11 +131,18 @@ function computeShiftTotals(shiftId) {
   };
 }
 
-// Configurable threshold above which a shift-close variance requires a written
-// note. Falls back to KES 500 if the setting hasn't been configured yet.
 function getVarianceThreshold() {
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('variance_note_threshold');
   return row ? +row.value : 500;
+}
+
+function getStockVarianceThresholds() {
+  const perItem = db.prepare('SELECT value FROM settings WHERE key = ?').get('stock_variance_value_threshold');
+  const total = db.prepare('SELECT value FROM settings WHERE key = ?').get('stock_variance_total_threshold');
+  return {
+    perItem: perItem ? +perItem.value : 500,
+    total: total ? +total.value : 2000,
+  };
 }
 
 function checkWaiterPatterns(waiterId) {
@@ -156,9 +165,6 @@ function checkWaiterPatterns(waiterId) {
 
   const patterns = [];
 
-  // A pattern of surpluses is flagged with the SAME weight as a pattern of
-  // shortages. Consistent "extra" cash can indicate skimming during the shift
-  // that gets papered over at close, so it's not treated as good news.
   if (surplusCount > 3 && surplusCount > shortageCount) {
     patterns.push({ type: 'CONSISTENT_SURPLUS', score: 20, detail: `${surplusCount} surpluses vs ${shortageCount} shortages` });
   }
@@ -175,6 +181,183 @@ function checkWaiterPatterns(waiterId) {
   return patterns;
 }
 
+// UPDATED: checkStockPatterns uses per-unit data with correct sign convention
+function checkStockPatterns(unitDiffs) {
+  const thresholds = getStockVarianceThresholds();
+  const patterns = [];
+
+  const worst = unitDiffs.reduce(
+    (max, it) => (Math.abs(it.value_difference) > Math.abs(max?.value_difference || 0) ? it : max),
+    null
+  );
+  if (worst && Math.abs(worst.value_difference) > thresholds.perItem) {
+    patterns.push({
+      type: 'LARGE_SINGLE_STOCK_VARIANCE',
+      score: 10,
+      detail: `${worst.product_name} (${worst.unit_name}): ${worst.difference_ml}ml ${worst.difference_ml > 0 ? 'short' : 'surplus'} (KES ${Math.abs(worst.value_difference)})`,
+    });
+  }
+
+  const totalShortageValue = unitDiffs.reduce((s, it) => s + Math.max(0, it.value_difference), 0);
+  if (totalShortageValue > thresholds.total) {
+    patterns.push({
+      type: 'HIGH_CUMULATIVE_STOCK_VARIANCE',
+      score: 15,
+      detail: `Cumulative shortage across ${unitDiffs.filter(i => i.value_difference > 0).length} unit(s): KES ${totalShortageValue}`,
+    });
+  }
+
+  return patterns;
+}
+
+// POST /api/shifts/:id/stocktake — REWRITTEN with per-unit support
+router.post('/:id/stocktake', requirePermission('shifts.own.end'), (req, res) => {
+  try {
+    const shift = db.prepare('SELECT * FROM shifts WHERE id = ?').get(req.params.id);
+    if (!shift) return res.status(404).json({ error: 'Not found' });
+    if (shift.user_id !== req.user.id && !req.user.permissions.includes('*')) return res.status(403).json({ error: 'Forbidden' });
+    if (shift.status !== 'OPEN') return res.status(409).json({ error: 'Shift already closed' });
+
+    const already = db.prepare('SELECT id FROM stocktakes WHERE shift_id = ?').get(shift.id);
+    if (already) {
+      return res.status(409).json({ error: 'A stock count has already been submitted for this shift', stocktakeId: already.id });
+    }
+
+    const { items } = req.body;
+    if (!Array.isArray(items)) return res.status(400).json({ error: 'items must be an array' });
+
+    const activeProducts = db.prepare('SELECT id, name, volume_ml, allow_serving FROM products WHERE active = 1 AND track_inventory = 1').all();
+    const productsById = Object.fromEntries(activeProducts.map(p => [p.id, p]));
+
+    const sellingUnitsByProduct = {};
+    for (const p of activeProducts) {
+      sellingUnitsByProduct[p.id] = db.prepare(
+        `SELECT id, name, volume_ml FROM selling_units WHERE product_id = ? AND active = 1 ORDER BY volume_ml DESC`
+      ).all(p.id);
+    }
+
+    const submittedIds = new Set(items.map(i => i.productId));
+    const missingProducts = activeProducts.filter(p => !submittedIds.has(p.id));
+    if (missingProducts.length > 0) {
+      return res.status(400).json({
+        error: `Stock count is incomplete — ${missingProducts.length} product(s) not counted`,
+        missingProducts: missingProducts.map(p => ({ id: p.id, name: p.name })),
+      });
+    }
+
+    // Validate every active selling unit per product is present
+    for (const it of items) {
+      const units = sellingUnitsByProduct[it.productId];
+      if (!units) continue;
+      const submittedUnitIds = new Set((it.unitCounts || []).map(u => u.sellingUnitId));
+      const missingUnits = units.filter(u => !submittedUnitIds.has(u.id));
+      if (missingUnits.length > 0) {
+        const product = productsById[it.productId];
+        return res.status(400).json({
+          error: `Stock count incomplete for ${product?.name || 'a product'} — missing: ${missingUnits.map(u => u.name).join(', ')}`,
+        });
+      }
+    }
+
+    const result = {};
+
+    const tx = db.transaction(() => {
+      const stInfo = db.prepare(`INSERT INTO stocktakes (started_by, status, shift_id) VALUES (?, 'SUBMITTED', ?)`).run(req.user.id, shift.id);
+      const stocktakeId = stInfo.lastInsertRowid;
+
+      const insertedItems = [];
+      const unitDiffs = [];
+
+      for (const it of items) {
+        const product = productsById[it.productId];
+        if (!product) continue;
+        const units = sellingUnitsByProduct[it.productId];
+
+        let physicalMl = 0;
+        const perUnit = [];
+        for (const unit of units) {
+          const submitted = (it.unitCounts || []).find(u => u.sellingUnitId === unit.id);
+          const qty = submitted ? Math.max(0, Math.floor(Number(submitted.count) || 0)) : 0;
+          const ml = qty * unit.volume_ml;
+          physicalMl += ml;
+          perUnit.push({ sellingUnitId: unit.id, name: unit.name, volumeMl: unit.volume_ml, qty, ml });
+        }
+
+        const stock = getProductStock(product.id);
+        const differenceMl = physicalMl - stock.balanceMl;
+        const valueDifference = Math.round(differenceMl * (stock.avgCostPerMl || 0));
+
+        const itemInfo = db.prepare(`
+          INSERT INTO stocktake_items (stocktake_id, product_id, system_stock_ml, physical_stock_ml, difference_ml, value_difference)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(stocktakeId, product.id, stock.balanceMl, physicalMl, differenceMl, valueDifference);
+
+        const insertUnitStmt = db.prepare(`
+          INSERT INTO stocktake_item_units (stocktake_item_id, selling_unit_id, counted_qty, unit_volume_ml, counted_ml)
+          VALUES (?, ?, ?, ?, ?)
+        `);
+        perUnit.forEach(u => insertUnitStmt.run(itemInfo.lastInsertRowid, u.sellingUnitId, u.qty, u.volumeMl, u.ml));
+
+        // Per-unit pattern signal
+        const { breakdown } = decomposeMlIntoUnits(stock.balanceMl, units);
+        const actualByUnit = Object.fromEntries(breakdown.map(b => [b.sellingUnitId, b.qty]));
+
+        for (const unit of units) {
+          const submitted = (it.unitCounts || []).find(u => u.sellingUnitId === unit.id);
+          const countedQty = submitted ? Math.max(0, Math.floor(Number(submitted.count) || 0)) : 0;
+          const actualQty = actualByUnit[unit.id] ?? 0;
+          const diffMl = (actualQty - countedQty) * unit.volume_ml;
+          const priceRow = db.prepare(`
+            SELECT cost_price FROM product_prices WHERE selling_unit_id = ? AND active = 1 ORDER BY effective_from DESC LIMIT 1
+          `).get(unit.id);
+          const costPerMl = unit.volume_ml > 0 ? (priceRow?.cost_price || 0) / unit.volume_ml : 0;
+          unitDiffs.push({
+            product_name: product.name,
+            unit_name: unit.name,
+            difference_ml: diffMl,
+            value_difference: Math.round(diffMl * (costPerMl || stock.avgCostPerMl || 0)),
+          });
+        }
+
+        insertedItems.push({
+          product_name: product.name,
+          difference_ml: differenceMl,
+          value_difference: valueDifference,
+          physical_ml: physicalMl,
+          system_ml: stock.balanceMl,
+        });
+      }
+
+      const patterns = checkStockPatterns(unitDiffs);
+      patterns.forEach(p => {
+        db.prepare(`INSERT INTO waiver_patterns (waiter_id, pattern_type, score, details) VALUES (?, ?, ?, ?)`)
+          .run(req.user.id, p.type, p.score, p.detail);
+      });
+
+      writeAudit({
+        event: 'SHIFT_STOCKTAKE_SUBMITTED', userId: req.user.id, role: req.user.role,
+        entityType: 'STOCKTAKE', entityId: stocktakeId,
+        newValue: { shiftId: shift.id, itemCount: insertedItems.length, patterns },
+      });
+
+      const totalAbsValue = insertedItems.reduce((s, i) => s + Math.abs(i.value_difference), 0);
+      const topDiscrepancies = insertedItems.slice().sort((a, b) => Math.abs(b.value_difference) - Math.abs(a.value_difference)).slice(0, 3);
+
+      result.stocktakeId = stocktakeId;
+      result.itemCount = insertedItems.length;
+      result.totalAbsValueDifference = totalAbsValue;
+      result.topDiscrepancies = topDiscrepancies;
+      result.flagged = patterns.length > 0;
+    });
+    tx();
+
+    res.status(201).json(result);
+  } catch (error) {
+    console.error('Error submitting shift stocktake:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+});
+
 // POST /api/shifts/:id/end
 router.post('/:id/end', requirePermission('shifts.own.end'), (req, res) => {
   try {
@@ -188,6 +371,14 @@ router.post('/:id/end', requirePermission('shifts.own.end'), (req, res) => {
       return res.status(409).json({
         error: `You still have ${openTabs.length} open tab(s). Settle them or transfer them to another shift before closing.`,
         openTabs,
+      });
+    }
+
+    const stocktake = db.prepare('SELECT id FROM stocktakes WHERE shift_id = ?').get(shift.id);
+    if (!stocktake) {
+      return res.status(409).json({
+        error: 'You must submit a physical stock count before closing this shift.',
+        stockCountRequired: true,
       });
     }
 
@@ -335,12 +526,19 @@ router.get('/:id/report', (req, res) => {
 
     const recounts = db.prepare('SELECT * FROM shift_recounts WHERE shift_id = ? ORDER BY created_at DESC').all(shift.id);
 
-    // Recent flagged cash-variance patterns for this waiter, so admins reviewing
-    // a single shift's report can see it in context of their broader history.
     const flags = db.prepare(`
-      SELECT pattern_type, score, details FROM waiver_patterns
-      WHERE waiter_id = ? ORDER BY id DESC LIMIT 20
+      SELECT pattern_type, score, details, detected_at, resolved_at FROM waiver_patterns
+      WHERE waiter_id = ? ORDER BY detected_at DESC LIMIT 20
     `).all(shift.user_id);
+
+    const stocktake = db.prepare('SELECT * FROM stocktakes WHERE shift_id = ?').get(shift.id);
+    const stocktakeItems = stocktake
+      ? db.prepare(`
+          SELECT sti.*, p.name AS product_name FROM stocktake_items sti
+          JOIN products p ON p.id = sti.product_id WHERE stocktake_id = ?
+          ORDER BY ABS(sti.value_difference) DESC
+        `).all(stocktake.id)
+      : [];
 
     res.json({
       shift, user, reconciliation,
@@ -350,6 +548,7 @@ router.get('/:id/report', (req, res) => {
       debts: { count: debts.length, total: totalDebts, items: debts },
       recounts: recounts,
       flags: flags,
+      stocktake: stocktake ? { ...stocktake, items: stocktakeItems } : null,
       audit: {
         startedAt: shift.started_at, endedAt: shift.ended_at, closedBy: shift.closed_by,
       },

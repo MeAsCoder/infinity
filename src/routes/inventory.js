@@ -122,6 +122,9 @@ router.post('/stocktake/:id/count', requirePermission('stocktake.manage'), (req,
 });
 
 // Approving a stocktake creates the actual (audited) stock_adjustments + ledger entries.
+// This also works unchanged for a waiter's shift-close stocktake (status =
+// 'SUBMITTED') — there's no status check here, so admin can approve either
+// an ad-hoc manual stocktake or a shift-linked one through this same route.
 router.post('/stocktake/:id/approve', requirePermission('stock.approve'), (req, res) => {
   const stocktake = db.prepare('SELECT * FROM stocktakes WHERE id = ?').get(req.params.id);
   if (!stocktake) return res.status(404).json({ error: 'Not found' });
@@ -145,6 +148,37 @@ router.post('/stocktake/:id/approve', requirePermission('stock.approve'), (req, 
   });
   tx();
   res.json({ ok: true });
+});
+
+// GET /api/inventory/stocktake/discrepancies — cross-waiter view of every
+// shift-linked stock count with a nonzero difference, for admin review. This
+// must be declared BEFORE the generic /stocktake/:id route below, or Express
+// will try to treat "discrepancies" as a stocktake id.
+//
+// Ad-hoc admin stocktakes (shift_id IS NULL) are excluded — those already
+// have their own detail view via GET /stocktake/:id.
+router.get('/stocktake/discrepancies', requirePermission('stock.approve'), (req, res) => {
+  try {
+    const { limit } = req.query;
+    const rows = db.prepare(`
+      SELECT sti.id, sti.stocktake_id, sti.product_id, p.name AS product_name,
+             sti.system_stock_ml, sti.physical_stock_ml, sti.difference_ml, sti.value_difference,
+             sti.adjustment_id,
+             st.shift_id, st.status AS stocktake_status, st.created_at,
+             u.id AS waiter_id, u.name AS waiter_name
+      FROM stocktake_items sti
+      JOIN stocktakes st ON st.id = sti.stocktake_id
+      JOIN products p ON p.id = sti.product_id
+      JOIN users u ON u.id = st.started_by
+      WHERE st.shift_id IS NOT NULL AND sti.difference_ml != 0
+      ORDER BY ABS(sti.value_difference) DESC
+      LIMIT ?
+    `).all(+(limit || 200));
+    res.json(rows);
+  } catch (error) {
+    console.error('Error fetching stock discrepancies:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 router.get('/stocktake/:id', (req, res) => {

@@ -8,6 +8,16 @@ const { getProductStock, getCustomerBalance } = require('../ledger');
 router.use(authMiddleware);
 router.use(requirePermission('reports.view', '*'));
 
+// Helper function to get stock reconciliation status for a shift
+function getStockReconciliationStatus(shiftId) {
+    const recon = db.prepare(`
+        SELECT status, total_variance_value 
+        FROM stock_reconciliations 
+        WHERE shift_id = ?
+    `).get(shiftId);
+    return recon || { status: 'PENDING', total_variance_value: 0 };
+}
+
 // GET /api/reports/dashboard
 router.get('/dashboard', (req, res) => {
   try {
@@ -199,12 +209,16 @@ router.get('/operations', (req, res) => {
       };
     });
 
+    // FIXED: Using total_variance_value instead of total_variance_units
     const recentClosedShifts = db.prepare(`
       SELECT sh.id, sh.user_id, u.name AS waiter_name, sh.started_at, sh.ended_at,
-             sr.expected_cash, sr.actual_cash, sr.variance, sr.notes
+             sr.expected_cash, sr.actual_cash, sr.variance, sr.notes,
+             COALESCE(recon.status, 'PENDING') AS reconciliation_status,
+             COALESCE(recon.total_variance_value, 0) AS variance_value
       FROM shifts sh
       JOIN users u ON u.id = sh.user_id
       LEFT JOIN shift_reconciliations sr ON sr.shift_id = sh.id
+      LEFT JOIN stock_reconciliations recon ON recon.shift_id = sh.id
       WHERE sh.status = 'CLOSED'
       ORDER BY sh.ended_at DESC
       LIMIT 15
@@ -341,18 +355,6 @@ router.get('/waiters-performance', (req, res) => {
         else if (startDate && endDate) { salesSql += ` AND DATE(server_created_at) BETWEEN ? AND ?`; salesParams.push(startDate, endDate); }
         const sales = db.prepare(salesSql).get(...salesParams);
 
-        // Debt/credit data comes from credit_ledger — the actual system sales.js
-        // writes to on a credit sale or a walk-out debt. There is no separate
-        // "debt_logs" table in this schema; querying credit_ledger here keeps
-        // this route consistent with what /api/sales/waiter/:id/debts already
-        // returns on the waiter's own dashboard.
-        //
-        // IMPORTANT: this nets PAYMENT/WRITE_OFF entries (written by
-        // /api/sales/debts/:id/resolve) against the original SALE entry, per
-        // sale, and only counts/sums sales that still have a positive balance.
-        // A naive SUM(amount) WHERE type='SALE' (the old version of this
-        // query) reports lifetime gross debt ever incurred and never reflects
-        // a debt being marked paid or written off — this fixes that.
         const debtAgg = db.prepare(`
           WITH sale_balances AS (
             SELECT cl.ref_id AS sale_id, COALESCE(SUM(cl.amount), 0) AS balance
@@ -367,8 +369,6 @@ router.get('/waiters-performance', (req, res) => {
           FROM sale_balances
         `).get(waiter.id);
 
-        // Same netting logic as debtAgg above, applied per-sale so only
-        // still-owing debts show up in the detail list (not resolved ones).
         const allDebts = db.prepare(`
           SELECT s.id AS sale_id, s.receipt_number, s.tab_label, c.name AS customer_name,
                  MAX(cl.created_at) AS created_at,
@@ -397,9 +397,6 @@ router.get('/waiters-performance', (req, res) => {
           tipsTotal = tips?.total_tips || 0;
         } catch (e) {}
 
-        // Pattern scores — waiver_patterns only has id/waiter_id/pattern_type/
-        // score/details (see shifts.js), so this orders by id rather than a
-        // timestamp column that doesn't exist on this table.
         const patterns = db.prepare(`
           SELECT pattern_type, score, details FROM waiver_patterns
           WHERE waiter_id = ? ORDER BY id DESC LIMIT 5
@@ -545,8 +542,6 @@ router.get('/export', (req, res) => {
     }
     const expenses = db.prepare(`SELECT * FROM expenses ${expFilter}`).all(...expParams);
 
-    // Debt export now reads credit_ledger (the real system sales.js writes to)
-    // instead of the non-existent "debt_logs" table the original code queried.
     let debtFilter = '';
     let debtParams = [];
     if (date) {
@@ -576,7 +571,7 @@ router.get('/export', (req, res) => {
       summary: { totalRevenue, totalDiscounts, totalTransactions, averageTransaction: totalTransactions > 0 ? totalRevenue / totalTransactions : 0, totalDebts, debtCount: debts.length },
       sales, saleItems, payments, reconciliations, expenses, debts
     });
-  } catch (error) {~~
+  } catch (error) {
     console.error('Error in export:', error);
     res.status(500).json({ error: 'Failed to export report' });
   }

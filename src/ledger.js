@@ -25,7 +25,7 @@ function appendInventoryLedger({ productId, changeMl, reason, refType, refId, us
 
   if (reason === 'RECEIPT' && changeMl > 0 && typeof incomingTotalCost === 'number') {
     const existingValue = current.balanceMl * current.avgCostPerMl;
-    const incomingValue = incomingTotalCost; // total cost (cents) for the whole receipt, in ml terms
+    const incomingValue = incomingTotalCost;
     const totalMl = newBalance;
     newAvgCost = totalMl > 0 ? (existingValue + incomingValue) / totalMl : 0;
   }
@@ -86,6 +86,56 @@ function nextReceiptNumber() {
   return `INF-${ymd}-${String(n).padStart(5, '0')}`;
 }
 
+/**
+ * Decompose a total stock volume (ml) into a breakdown of selling units.
+ * Uses largest denomination first (e.g., bottles first, then tots).
+ * 
+ * For 750ml products, this correctly gives: Full Bottles (750ml) + Tots (30ml)
+ * For 250ml products: Full Bottles (250ml) + Half (125ml)
+ * 
+ * @param {number} balanceMl - Total stock in ml
+ * @param {Array} sellingUnits - Array of { id, name, volume_ml }
+ * @returns {Object} { breakdown: [{ sellingUnitId, name, volumeMl, qty, ml }], remainderMl }
+ */
+function decomposeMlIntoUnits(balanceMl, sellingUnits) {
+  // Sort by volume descending (largest first)
+  const sorted = [...sellingUnits].sort((a, b) => b.volume_ml - a.volume_ml);
+  let remaining = Math.max(0, Math.round(balanceMl));
+  const breakdown = [];
+  
+  for (const unit of sorted) {
+    const volume = unit.volume_ml || 1;
+    const qty = volume > 0 ? Math.floor(remaining / volume) : 0;
+    const ml = qty * volume;
+    remaining -= ml;
+    breakdown.push({
+      sellingUnitId: unit.id,
+      name: unit.name,
+      volumeMl: volume,
+      qty: qty,
+      ml: ml
+    });
+  }
+  
+  // remaining should always be 0 now since we've allocated everything
+  return { breakdown, remainderMl: remaining };
+}
+
+/**
+ * NEW: Decompose stock into units with specific unit types excluded.
+ * Used for 750ml products where we don't want "Half" units.
+ * 
+ * @param {number} balanceMl - Total stock in ml
+ * @param {Array} sellingUnits - Array of { id, name, volume_ml }
+ * @param {Array} excludeUnitIds - Array of unit IDs to exclude
+ * @returns {Object} { breakdown: [{ sellingUnitId, name, volumeMl, qty, ml }], remainderMl }
+ */
+function decomposeMlIntoUnitsExcluding(balanceMl, sellingUnits, excludeUnitIds) {
+  const excludeSet = new Set(excludeUnitIds || []);
+  const filtered = sellingUnits.filter(u => !excludeSet.has(u.id));
+  return decomposeMlIntoUnits(balanceMl, filtered);
+}
+
 module.exports = {
   getProductStock,
   appendInventoryLedger,
@@ -94,4 +144,6 @@ module.exports = {
   writeAudit,
   formatStock,
   nextReceiptNumber,
+  decomposeMlIntoUnits,
+  decomposeMlIntoUnitsExcluding,
 };

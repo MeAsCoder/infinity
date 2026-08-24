@@ -69,25 +69,53 @@ router.post('/', (req, res) => {
   }
 });
 
-// PUT /api/users/:id - Update a user
+// PUT /api/users/:id - Update a user (FIXED)
 router.put('/:id', (req, res) => {
   const existing = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!existing) return res.status(404).json({ error: 'Not found' });
+  
   const { name, phone, active, maxDiscountPercent, roleName, password } = req.body;
+  
+  // Get role ID if roleName is provided
   let roleId = existing.role_id;
   if (roleName) {
     const role = db.prepare('SELECT * FROM roles WHERE name = ?').get(roleName);
     if (!role) return res.status(400).json({ error: 'Unknown role' });
     roleId = role.id;
   }
-  db.prepare(`
-    UPDATE users SET name=?, phone=?, active=?, max_discount_percent=?, role_id=${password ? ', password_hash=?' : ''} WHERE id = ?
-  `).run(
-    ...(password
-      ? [name ?? existing.name, phone ?? existing.phone, active !== undefined ? (active ? 1 : 0) : existing.active, maxDiscountPercent ?? existing.max_discount_percent, roleId, hashPassword(password), req.params.id]
-      : [name ?? existing.name, phone ?? existing.phone, active !== undefined ? (active ? 1 : 0) : existing.active, maxDiscountPercent ?? existing.max_discount_percent, roleId, req.params.id])
-  );
-  writeAudit({ event: 'USER_UPDATED', userId: req.user.id, role: req.user.role, entityType: 'USER', entityId: +req.params.id, oldValue: { active: existing.active, role_id: existing.role_id }, newValue: req.body });
+  
+  // Build the update query dynamically
+  let sql = `UPDATE users SET name = ?, phone = ?, active = ?, max_discount_percent = ?, role_id = ?`;
+  const params = [
+    name ?? existing.name,
+    phone ?? existing.phone,
+    active !== undefined ? (active ? 1 : 0) : existing.active,
+    maxDiscountPercent !== undefined ? maxDiscountPercent : existing.max_discount_percent,
+    roleId
+  ];
+  
+  // If password is provided, add it to the update
+  if (password) {
+    sql += `, password_hash = ?`;
+    params.push(hashPassword(password));
+  }
+  
+  sql += ` WHERE id = ?`;
+  params.push(req.params.id);
+  
+  // Execute the update
+  db.prepare(sql).run(...params);
+  
+  writeAudit({ 
+    event: 'USER_UPDATED', 
+    userId: req.user.id, 
+    role: req.user.role, 
+    entityType: 'USER', 
+    entityId: +req.params.id, 
+    oldValue: { active: existing.active, role_id: existing.role_id }, 
+    newValue: req.body 
+  });
+  
   res.json({ ok: true });
 });
 

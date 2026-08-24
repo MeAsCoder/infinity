@@ -2,6 +2,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const stockReconciliationRoutes = require('./routes/stockReconciliation');
 
 const app = express();
 app.use(cors());
@@ -24,6 +25,8 @@ app.use('/api/sync', require('./routes/sync'));
 
 // NEW: Waiter routes for patterns and dashboard
 app.use('/api/waiter', require('./routes/waiter'));
+app.use('/api/stock-reconciliation', stockReconciliationRoutes);
+
 
 // Error handling middleware
 app.use((err, req, res, next) => {

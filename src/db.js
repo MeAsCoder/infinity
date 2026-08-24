@@ -1,8 +1,25 @@
 // db.js
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'infinity.db');
+
+// Ensure the directory for the DB file exists before opening it. This matters
+// specifically on hosts like Render, where DB_PATH points at a mounted
+// persistent disk (e.g. /data/infinity.db). The disk itself exists once
+// attached, but this guards against a bad/mistyped path failing silently or
+// against the very first boot before the mount is fully ready.
+const dbDir = path.dirname(DB_PATH);
+if (!fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
+}
+
+// Logged on every boot so it's immediately visible in Render's log stream
+// whether the app is actually writing to the persistent disk or has silently
+// fallen back to the ephemeral local path (e.g. because DB_PATH wasn't set).
+console.log(`[db] Opening SQLite database at ${DB_PATH}`);
+
 const db = new Database(DB_PATH);
 
 db.pragma('journal_mode = WAL');
@@ -145,6 +162,7 @@ CREATE TABLE IF NOT EXISTS stock_adjustments (
 CREATE TABLE IF NOT EXISTS stocktakes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   started_by INTEGER REFERENCES users(id),
+  shift_id INTEGER REFERENCES shifts(id),
   status TEXT NOT NULL DEFAULT 'OPEN',
   created_at TEXT DEFAULT (datetime('now')),
   approved_by INTEGER REFERENCES users(id),
@@ -161,6 +179,18 @@ CREATE TABLE IF NOT EXISTS stocktake_items (
   value_difference INTEGER NOT NULL,
   reason TEXT,
   adjustment_id INTEGER REFERENCES stock_adjustments(id)
+);
+
+-- NEW: Per-unit stocktake details for accurate reconciliation
+CREATE TABLE IF NOT EXISTS stocktake_item_units (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stocktake_item_id INTEGER NOT NULL REFERENCES stocktake_items(id),
+  selling_unit_id INTEGER NOT NULL REFERENCES selling_units(id),
+  counted_qty INTEGER NOT NULL DEFAULT 0,
+  unit_volume_ml INTEGER NOT NULL,
+  counted_ml INTEGER NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(stocktake_item_id, selling_unit_id)
 );
 
 CREATE TABLE IF NOT EXISTS customers (
@@ -293,7 +323,8 @@ CREATE TABLE IF NOT EXISTS sales (
   client_created_at TEXT,
   server_created_at TEXT DEFAULT (datetime('now')),
   settled_at TEXT,
-  sync_status TEXT NOT NULL DEFAULT 'SYNCED'
+  sync_status TEXT NOT NULL DEFAULT 'SYNCED',
+  tip INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sale_items (
@@ -402,6 +433,43 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL
 );
 
+-- =============================================
+-- STOCK RECONCILIATION TABLES
+-- =============================================
+
+CREATE TABLE IF NOT EXISTS stock_reconciliations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  shift_id INTEGER NOT NULL REFERENCES shifts(id),
+  stocktake_id INTEGER REFERENCES stocktakes(id),
+  status TEXT NOT NULL DEFAULT 'PENDING',
+  total_expected_revenue INTEGER NOT NULL DEFAULT 0,
+  total_actual_stock_value INTEGER NOT NULL DEFAULT 0,
+  total_counted_stock_value INTEGER NOT NULL DEFAULT 0,
+  total_variance_value INTEGER NOT NULL DEFAULT 0,
+  notes TEXT,
+  reconciled_by INTEGER REFERENCES users(id),
+  reconciled_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(shift_id)
+);
+
+CREATE TABLE IF NOT EXISTS stock_reconciliation_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reconciliation_id INTEGER NOT NULL REFERENCES stock_reconciliations(id),
+  product_id INTEGER NOT NULL REFERENCES products(id),
+  selling_unit_id INTEGER NOT NULL REFERENCES selling_units(id),
+  actual_stock INTEGER NOT NULL DEFAULT 0,
+  counted_stock INTEGER NOT NULL DEFAULT 0,
+  variance INTEGER NOT NULL DEFAULT 0,
+  expected_quantity INTEGER NOT NULL DEFAULT 0,
+  expected_revenue INTEGER NOT NULL DEFAULT 0,
+  unit_price INTEGER NOT NULL DEFAULT 0,
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Indexes
 CREATE INDEX IF NOT EXISTS idx_inventory_ledger_product ON inventory_ledger(product_id);
 CREATE INDEX IF NOT EXISTS idx_credit_ledger_customer ON credit_ledger(customer_id);
 CREATE INDEX IF NOT EXISTS idx_sales_shift ON sales(shift_id);
@@ -423,6 +491,11 @@ CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
 CREATE INDEX IF NOT EXISTS idx_shift_recounts_shift ON shift_recounts(shift_id);
 CREATE INDEX IF NOT EXISTS idx_waiver_patterns_waiter ON waiver_patterns(waiter_id);
 CREATE INDEX IF NOT EXISTS idx_waiver_patterns_resolved ON waiver_patterns(resolved_at);
+CREATE INDEX IF NOT EXISTS idx_stocktakes_shift ON stocktakes(shift_id);
+CREATE INDEX IF NOT EXISTS idx_stock_reconciliations_shift ON stock_reconciliations(shift_id);
+CREATE INDEX IF NOT EXISTS idx_stock_reconciliations_status ON stock_reconciliations(status);
+CREATE INDEX IF NOT EXISTS idx_stock_reconciliation_items_product ON stock_reconciliation_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_stocktake_item_units_item ON stocktake_item_units(stocktake_item_id);
 `);
 
 // ---------------------------------------------------------------------------
@@ -446,8 +519,10 @@ safeAlter(`ALTER TABLE shifts ADD COLUMN notes TEXT`);
 safeAlter(`ALTER TABLE sales ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'SYNCED'`);
 safeAlter(`ALTER TABLE debt_logs ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))`);
 safeAlter(`ALTER TABLE sales ADD COLUMN tip INTEGER NOT NULL DEFAULT 0`);
+safeAlter(`ALTER TABLE stocktake_items ADD COLUMN selling_unit_id INTEGER REFERENCES selling_units(id)`);
+safeAlter(`ALTER TABLE stocktakes ADD COLUMN shift_id INTEGER REFERENCES shifts(id)`);
 
-// Create new tables for enhanced features
+// Create new tables for enhanced features (if they don't exist)
 db.exec(`
   CREATE TABLE IF NOT EXISTS shift_recounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -475,43 +550,6 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_shift_recounts_shift ON shift_recounts(shift_id);
   CREATE INDEX IF NOT EXISTS idx_waiver_patterns_waiter ON waiver_patterns(waiter_id);
   CREATE INDEX IF NOT EXISTS idx_waiver_patterns_resolved ON waiver_patterns(resolved_at);
-`);
-
-// In db.js - Add this at the end of the file, before module.exports
-
-// Create waiver_patterns table if it doesn't exist
-db.exec(`
-  CREATE TABLE IF NOT EXISTS waiver_patterns (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    waiter_id INTEGER NOT NULL REFERENCES users(id),
-    pattern_type TEXT NOT NULL,
-    score INTEGER NOT NULL DEFAULT 0,
-    details TEXT,
-    detected_at TEXT DEFAULT (datetime('now')),
-    resolved_at TEXT
-  )
-`);
-
-// Create indexes for waiver_patterns
-db.exec(`
-  CREATE INDEX IF NOT EXISTS idx_waiver_patterns_waiter ON waiver_patterns(waiter_id);
-  CREATE INDEX IF NOT EXISTS idx_waiver_patterns_resolved ON waiver_patterns(resolved_at);
-`);
-
-// Create shift_recounts table if it doesn't exist
-db.exec(`
-  CREATE TABLE IF NOT EXISTS shift_recounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    shift_id INTEGER NOT NULL REFERENCES shifts(id),
-    actual_cash INTEGER NOT NULL,
-    notes TEXT,
-    counted_by INTEGER REFERENCES users(id),
-    created_at TEXT DEFAULT (datetime('now'))
-  )
-`);
-
-db.exec(`
-  CREATE INDEX IF NOT EXISTS idx_shift_recounts_shift ON shift_recounts(shift_id);
 `);
 
 module.exports = db;
