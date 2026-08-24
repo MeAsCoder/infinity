@@ -327,6 +327,7 @@ CREATE TABLE IF NOT EXISTS sales (
   tip INTEGER NOT NULL DEFAULT 0
 );
 
+-- UPDATED: Added product_name column to sale_items
 CREATE TABLE IF NOT EXISTS sale_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sale_id INTEGER NOT NULL REFERENCES sales(id),
@@ -338,7 +339,8 @@ CREATE TABLE IF NOT EXISTS sale_items (
   unit_price INTEGER NOT NULL,
   unit_cost INTEGER NOT NULL,
   line_total INTEGER NOT NULL,
-  line_cost INTEGER NOT NULL
+  line_cost INTEGER NOT NULL,
+  product_name TEXT
 );
 
 CREATE TABLE IF NOT EXISTS payments (
@@ -539,6 +541,9 @@ safeAlter(`ALTER TABLE sales ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'SYNCE
 safeAlter(`ALTER TABLE debt_logs ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))`);
 safeAlter(`ALTER TABLE sales ADD COLUMN tip INTEGER NOT NULL DEFAULT 0`);
 safeAlter(`ALTER TABLE stocktake_items ADD COLUMN selling_unit_id INTEGER REFERENCES selling_units(id)`);
+
+// NEW: Add product_name column to sale_items
+safeAlter(`ALTER TABLE sale_items ADD COLUMN product_name TEXT`);
 
 // FIXED: Only add shift_id if the stocktakes table exists
 try {

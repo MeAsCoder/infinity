@@ -55,12 +55,25 @@ function resolveLineItems(items) {
   return { subtotal, lineData };
 }
 
+// UPDATED: Store product_name in sale_items
 function writeLineItems(saleId, lineData, { userId, deviceId }) {
   for (const line of lineData) {
     db.prepare(`
-      INSERT INTO sale_items (sale_id, product_id, selling_unit_id, unit_name, volume_ml, quantity, unit_price, unit_cost, line_total, line_cost)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(saleId, line.product.id, line.su.id, line.su.name, line.su.volume_ml, line.qty, line.unitPrice, line.unitCost, line.lineTotal, line.lineCost);
+      INSERT INTO sale_items (sale_id, product_id, selling_unit_id, unit_name, volume_ml, quantity, unit_price, unit_cost, line_total, line_cost, product_name)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      saleId, 
+      line.product.id, 
+      line.su.id, 
+      line.su.name, 
+      line.su.volume_ml, 
+      line.qty, 
+      line.unitPrice, 
+      line.unitCost, 
+      line.lineTotal, 
+      line.lineCost,
+      line.product.name  // Store the product name
+    );
 
     if (line.product.track_inventory) {
       appendInventoryLedger({
@@ -591,6 +604,35 @@ router.post('/:id/refund', requirePermission('sales.refund'), (req, res) => {
 
   try { tx(); } catch (e) { return res.status(422).json({ error: e.message }); }
   res.status(201).json(result);
+});
+
+// Add this to your sales.js routes file
+
+// GET /api/sales/:id/receipt - Get receipt data for printing
+router.get('/:id/receipt', requirePermission('sales.view_all'), (req, res) => {
+  const sale = serializeSale(req.params.id);
+  if (!sale) return res.status(404).json({ error: 'Not found' });
+  
+  // Get product names for each item
+  const itemsWithNames = sale.items.map(item => {
+    const product = db.prepare('SELECT name FROM products WHERE id = ?').get(item.product_id);
+    return {
+      ...item,
+      product_name: product?.name || item.unit_name || `Product #${item.product_id}`
+    };
+  });
+  
+  res.json({
+    ...sale,
+    items: itemsWithNames,
+    receipt_number: sale.receipt_number,
+    total: sale.total,
+    subtotal: sale.subtotal,
+    discount_total: sale.discount_total || 0,
+    customer_name: sale.tab_label || 'Walk-in',
+    created_at: sale.server_created_at,
+    waiter_name: req.user?.name || 'Unknown'
+  });
 });
 
 module.exports = router;
